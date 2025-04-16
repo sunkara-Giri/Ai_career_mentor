@@ -66,7 +66,7 @@ An intelligent career development platform that provides personalized guidance, 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/ai-career-mentor.git
+git clone https://github.com/sunkara-Giri/Ai_career_mentor.git
 cd ai-career-mentor
 ```
 
