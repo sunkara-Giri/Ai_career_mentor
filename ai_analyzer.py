@@ -1,87 +1,150 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 import json
 import sys
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import logging
+from dotenv import load_dotenv
 
-class AIAnalyzer:
-    def __init__(self):
-        print("Initializing AI Analyzer...")
-        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3-0324", trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-V3-0324", trust_remote_code=True)
-        
-        # Move model to GPU if available
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        print(f"Model loaded on {self.device}")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    def analyze_resume(self, resume_text):
-        print("Analyzing resume...")
-        # Prepare the prompt for resume analysis
-        prompt = f"""Analyze the following resume and provide a detailed analysis in JSON format:
-        {resume_text}
+# Load environment variables
+load_dotenv()
+
+def load_model():
+    """Load the AI model and tokenizer."""
+    try:
+        # Using a more reliable model for text analysis
+        model_name = "microsoft/phi-2"  # Smaller, faster model
+        logger.info(f"Loading model: {model_name}")
         
-        Please provide analysis in the following format:
+        # Get Hugging Face token
+        hf_token = os.getenv('HUGGINGFACE_API_KEY')
+        if not hf_token:
+            raise ValueError("Hugging Face API key not found in environment variables")
+        
+        # Load model with authentication
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            token=hf_token,
+            trust_remote_code=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            token=hf_token,
+            torch_dtype=torch.float32,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        return model, tokenizer
+    except Exception as e:
+        logger.error(f"Error loading model: {str(e)}")
+        raise
+
+def analyze_resume(text):
+    """Analyze resume text using the AI model."""
+    try:
+        model, tokenizer = load_model()
+        
+        # Prepare the prompt
+        prompt = f"""Analyze the following resume text and provide a structured analysis:
+        
+        Resume Text:
+        {text}
+        
+        Provide a JSON response with the following structure:
         {{
             "technical_skills": ["skill1", "skill2", ...],
             "soft_skills": ["skill1", "skill2", ...],
             "years_of_experience": number,
-            "education": {{
-                "degree": "string",
-                "field": "string",
-                "institution": "string"
-            }},
-            "project_highlights": ["highlight1", "highlight2", ...],
+            "education": [
+                {{
+                    "degree": "string",
+                    "institution": "string",
+                    "year": number
+                }}
+            ],
+            "project_highlights": ["project1", "project2", ...],
             "formatting_suggestions": ["suggestion1", "suggestion2", ...],
             "recommended_job_roles": ["role1", "role2", ...]
-        }}"""
-
-        # Generate analysis
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_length=1000,
+        }}
+        """
+        
+        # Generate response
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
+        outputs = model.generate(
+            inputs.input_ids,
+            max_length=2048,
             num_return_sequences=1,
             temperature=0.7,
-            top_p=0.9,
             do_sample=True
         )
         
-        # Decode and parse the response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print("Analysis completed")
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        # Extract the JSON part from the response
+        # Extract JSON from response
         try:
-            # Find the first '{' and last '}'
-            start_idx = response.find('{')
-            end_idx = response.rfind('}') + 1
-            json_str = response[start_idx:end_idx]
+            # Find the JSON part in the response
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            json_str = response[json_start:json_end]
+            
+            # Parse and validate JSON
             analysis = json.loads(json_str)
+            
+            # Ensure all required fields are present
+            required_fields = [
+                "technical_skills", "soft_skills", "years_of_experience",
+                "education", "project_highlights", "formatting_suggestions",
+                "recommended_job_roles"
+            ]
+            
+            for field in required_fields:
+                if field not in analysis:
+                    analysis[field] = []
+            
             return analysis
+            
         except json.JSONDecodeError as e:
-            print(f"Error parsing JSON: {e}")
-            # Fallback to a basic analysis if JSON parsing fails
+            logger.error(f"Error parsing JSON response: {str(e)}")
             return {
+                "error": "Failed to parse AI response",
                 "technical_skills": [],
                 "soft_skills": [],
                 "years_of_experience": 0,
-                "education": {
-                    "degree": "Not specified",
-                    "field": "Not specified",
-                    "institution": "Not specified"
-                },
+                "education": [],
                 "project_highlights": [],
-                "formatting_suggestions": ["Unable to analyze formatting"],
+                "formatting_suggestions": [],
                 "recommended_job_roles": []
             }
+            
+    except Exception as e:
+        logger.error(f"Error in analyze_resume: {str(e)}")
+        return {
+            "error": str(e),
+            "technical_skills": [],
+            "soft_skills": [],
+            "years_of_experience": 0,
+            "education": [],
+            "project_highlights": [],
+            "formatting_suggestions": [],
+            "recommended_job_roles": []
+        }
 
-    def get_job_recommendations(self, skills, experience):
-        # Prepare the prompt for job recommendations
+def get_job_recommendations(skills, experience):
+    """Generate job recommendations based on skills and experience."""
+    try:
+        model, tokenizer = load_model()
+        
+        # Prepare the prompt
         prompt = f"""Based on the following skills and experience, recommend suitable job roles:
+        
         Skills: {', '.join(skills)}
         Years of Experience: {experience}
         
-        Please provide recommendations in the following format:
+        Provide a JSON response with the following structure:
         {{
             "recommendations": [
                 {{
@@ -93,50 +156,56 @@ class AIAnalyzer:
                     "salary_range": "string"
                 }}
             ]
-        }}"""
-
-        # Generate recommendations
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_length=1000,
+        }}
+        """
+        
+        # Generate response
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
+        outputs = model.generate(
+            inputs.input_ids,
+            max_length=2048,
             num_return_sequences=1,
             temperature=0.7,
-            top_p=0.9,
             do_sample=True
         )
         
-        # Decode and parse the response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
+        # Extract JSON from response
         try:
-            # Find the first '{' and last '}'
-            start_idx = response.find('{')
-            end_idx = response.rfind('}') + 1
-            json_str = response[start_idx:end_idx]
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            json_str = response[json_start:json_end]
             recommendations = json.loads(json_str)
             return recommendations.get("recommendations", [])
-        except json.JSONDecodeError:
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing job recommendations JSON: {str(e)}")
             return []
-
-def main():
-    if len(sys.argv) != 2:
-        print(json.dumps({"error": "Please provide resume text"}))
-        sys.exit(1)
-
-    try:
-        # Get resume text from command line argument
-        resume_text = sys.argv[1]
-        
-        # Initialize analyzer and analyze resume
-        analyzer = AIAnalyzer()
-        analysis = analyzer.analyze_resume(resume_text)
-        
-        # Print the analysis as JSON
-        print(json.dumps(analysis))
+            
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+        logger.error(f"Error in get_job_recommendations: {str(e)}")
+        return []
 
 if __name__ == "__main__":
-    main() 
+    try:
+        if len(sys.argv) < 2:
+            print(json.dumps({"error": "No text provided"}))
+            sys.exit(1)
+            
+        resume_text = sys.argv[1]
+        
+        # Analyze resume
+        analysis = analyze_resume(resume_text)
+        
+        # Get job recommendations
+        if "error" not in analysis:
+            skills = analysis["technical_skills"] + analysis["soft_skills"]
+            experience = analysis["years_of_experience"]
+            recommendations = get_job_recommendations(skills, experience)
+            analysis["job_recommendations"] = recommendations
+        
+        print(json.dumps(analysis))
+        
+    except Exception as e:
+        print(json.dumps({"error": str(e)})) 

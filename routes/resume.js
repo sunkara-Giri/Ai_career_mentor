@@ -7,14 +7,14 @@ const { spawn } = require('child_process');
 const auth = require('../middleware/auth');
 const User = require('../models/User');
 
-// Configure multer for file upload
+// Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    const dir = 'uploads/resumes';
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    const uploadDir = 'uploads/resumes';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
     }
-    cb(null, dir);
+    cb(null, uploadDir);
   },
   filename: function (req, file, cb) {
     cb(null, Date.now() + path.extname(file.originalname));
@@ -30,77 +30,66 @@ const upload = multer({
     } else {
       cb(new Error('Invalid file type. Only PDF and Word documents are allowed.'));
     }
+  },
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
   }
 });
 
-// Helper function to extract text from different file types
-async function extractTextFromFile(filePath) {
+// Helper function to extract text from PDF
+async function extractTextFromPDF(filePath) {
   return new Promise((resolve, reject) => {
-    console.log('Extracting text from file:', filePath);
     const pythonProcess = spawn('python', ['extract_text.py', filePath]);
     let result = '';
-    let error = '';
 
     pythonProcess.stdout.on('data', (data) => {
       result += data.toString();
-      console.log('Text extraction output:', data.toString());
     });
 
     pythonProcess.stderr.on('data', (data) => {
-      error += data.toString();
-      console.error('Text extraction error:', data.toString());
+      console.error(`Python Error: ${data}`);
+      reject(new Error('Failed to extract text from PDF'));
     });
 
     pythonProcess.on('close', (code) => {
       if (code !== 0) {
-        reject(new Error(`Text extraction failed: ${error}`));
+        reject(new Error(`Python process exited with code ${code}`));
       } else {
         try {
-          const extractedText = JSON.parse(result);
-          if (extractedText.error) {
-            reject(new Error(extractedText.error));
-          } else {
-            resolve(extractedText.text);
-          }
-        } catch (err) {
-          reject(new Error('Failed to parse extracted text'));
+          const jsonResult = JSON.parse(result);
+          resolve(jsonResult.text);
+        } catch (error) {
+          reject(new Error('Failed to parse Python output'));
         }
       }
     });
   });
 }
 
-// Helper function to analyze resume using AI
-async function analyzeResumeWithAI(text) {
+// Helper function to analyze text with AI
+async function analyzeTextWithAI(text) {
   return new Promise((resolve, reject) => {
-    console.log('Starting AI analysis...');
-    const pythonProcess = spawn('python', ['ai_analyzer.py', text]);
+    const pythonProcess = spawn('python', ['ai_resume_analyzer.py', text]);
     let result = '';
-    let error = '';
 
     pythonProcess.stdout.on('data', (data) => {
       result += data.toString();
-      console.log('AI analysis output:', data.toString());
     });
 
     pythonProcess.stderr.on('data', (data) => {
-      error += data.toString();
-      console.error('AI analysis error:', data.toString());
+      console.error(`Python Error: ${data}`);
+      reject(new Error('Failed to analyze text with AI'));
     });
 
     pythonProcess.on('close', (code) => {
       if (code !== 0) {
-        reject(new Error(`AI analysis failed: ${error}`));
+        reject(new Error(`Python process exited with code ${code}`));
       } else {
         try {
-          const analysis = JSON.parse(result);
-          if (analysis.error) {
-            reject(new Error(analysis.error));
-          } else {
-            resolve(analysis);
-          }
-        } catch (err) {
-          reject(new Error('Failed to parse AI analysis'));
+          const analysisResult = JSON.parse(result);
+          resolve(analysisResult);
+        } catch (error) {
+          reject(new Error('Failed to parse AI analysis result'));
         }
       }
     });
@@ -114,35 +103,44 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
       return res.status(400).json({ message: 'No file uploaded' });
     }
 
-    console.log('File uploaded successfully:', req.file.path);
-
     // Extract text from the uploaded file
-    const extractedText = await extractTextFromFile(req.file.path);
-    console.log('Text extracted successfully');
+    const extractedText = await extractTextFromPDF(req.file.path);
 
-    if (!extractedText || extractedText.trim().length === 0) {
-      throw new Error('No text could be extracted from the resume');
+    // Analyze text with AI
+    const analysisResult = await analyzeTextWithAI(extractedText);
+
+    // Save analysis results to user's document
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
     }
 
-    // Analyze the resume using AI
-    const analysis = await analyzeResumeWithAI(extractedText);
-    console.log('Analysis completed successfully');
-
-    // Update user's resume analysis in the database
-    const user = await User.findById(req.user.id);
     user.resumeAnalysis = {
-      ...analysis,
-      filePath: req.file.path
+      text: extractedText,
+      entities: analysisResult.entities,
+      education: analysisResult.education,
+      experience: analysisResult.experience,
+      skills: analysisResult.skills,
+      jobRecommendations: analysisResult.job_recommendations,
+      resumeImprovements: analysisResult.resume_improvements,
+      lastUpdated: new Date()
     };
+
     await user.save();
+
+    // Clean up uploaded file
+    fs.unlinkSync(req.file.path);
 
     res.json({
       message: 'Resume analyzed successfully',
-      analysis: analysis
+      analysis: user.resumeAnalysis
     });
   } catch (error) {
-    console.error('Resume analysis error:', error);
-    res.status(500).json({ message: 'Failed to analyze resume', error: error.message });
+    console.error('Error processing resume:', error);
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    res.status(500).json({ message: 'Failed to process resume', error: error.message });
   }
 });
 
@@ -150,13 +148,21 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
 router.get('/analysis', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
-    if (!user.resumeAnalysis) {
-      return res.status(404).json({ message: 'No resume analysis found' });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
     }
+
+    if (!user.resumeAnalysis) {
+      return res.json({
+        message: 'No resume analysis found',
+        analysis: null
+      });
+    }
+
     res.json(user.resumeAnalysis);
   } catch (error) {
-    console.error('Get analysis error:', error);
-    res.status(500).json({ message: 'Failed to get resume analysis', error: error.message });
+    console.error('Error fetching resume analysis:', error);
+    res.status(500).json({ message: 'Failed to fetch resume analysis', error: error.message });
   }
 });
 
